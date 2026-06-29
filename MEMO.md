@@ -117,6 +117,8 @@ The three document classes update on independent cadences — the system handles
 
 Part A and Part B share one Python parser library. It is organised as a deterministic stack of stages with one LLM-backed step (LoB inference) used only at submission time. Per-document output is the canonical `Clause` record at the end of this section.
 
+**Terminology — what is a clause?** A *clause* in this system is a **numbered rule-bearing unit of the policy** — typically a numbered paragraph (`§3 Defence Costs`) or a numbered sub-paragraph (`§2.1 Insured`). Not a sentence. A clause may contain multiple sentences and lettered sub-items `(a)`, `(b)`, `(c)`, which stay **inside** the same `Clause` record because they're parts of one rule. But each numbered sub-paragraph under a parent heading (`§2.1`, `§2.2`, …) becomes its **own** `Clause` because each defines a distinct rule. This is the unit standard wording, broker wording, red-lines, and prior approvals all line up at — and it is the unit downstream comparison (§10), red-line check (§11), and finding production (§12) reason about. The only exception: clauses longer than ~2000 chars are sub-split with overlap for embedding-window reasons (see *Segmentation* below); the Clause record remains the semantic unit.
+
 **Per-format readers.**
 
 - **DOCX** (`01–05`, `07–08`): `python-docx` for paragraphs, runs, headings, tables, headers/footers. For the few things the high-level API hides — list-numbering definitions in `word/numbering.xml`, custom styles, tracked-change markers — the reader falls back to direct OOXML parsing with `lxml`. Both endorsements and the schedule are DOCX; the reader sees them as paragraph streams plus table rows.
