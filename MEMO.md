@@ -6,73 +6,139 @@
 
 ## 1. Problem & approach
 
-For every broker clause an underwriter must answer four questions: 
-1. Does it diverge from our standard wording?
-2. Does the divergence breach a red-line or create exposure?
-3. What exact text caused the issue? and
-4. Has a similar position been approved before — and is that precedent actually transferable?
-We propose a decision-support pipeline that returns a structured **finding set**, each finding evidenced by a verbatim text span from the source. The system never decides; it surfaces, explains, and routes. The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data.
+For every broker clause an underwriter must answer four questions: does it diverge from our standard wording, does the divergence breach a red-line or create exposure, what exact text caused the issue, and has a similar position been approved before — and is that precedent actually transferable. We propose a decision-support system structured as **two pipelines sharing one knowledge base**:
 
-## 2. End-to-end architecture
+- **Part A — Knowledge Base build.** Offline / event-triggered ingestion of insurer-side documents (standard wording, red-lines, prior approvals). Slow-changing inputs; runs when those documents are added or updated.
+- **Part B — Submission review.** Online, per-submission pipeline. Parses the broker pack, queries the KB, produces evidenced findings, captures reviewer feedback.
 
-Event-driven pipeline on AKS, services communicating over Kafka. State persisted to MongoDB (clauses, findings, partial pipeline state) and Azure SQL (audit, feedback, evaluation). Raw files in Blob Storage.
+The system never decides — it surfaces, explains, and routes. The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data for the next iteration.
+
+## 2. Architecture at a glance
+
+Both pipelines run on AKS with services communicating over Kafka. Shared substrate:
+
+- **Blob Storage** — raw documents, immutable, content-hashed.
+- **MongoDB** — typed records (clauses, red-lines, prior approvals, findings, partial pipeline state).
+- **Azure AI Search** — three logical indexes (`standard_clauses`, `red_lines`, `prior_approvals`), each with vector + BM25 and rich filter fields.
+- **Azure SQL** — document lifecycle registry, audit trail of every LLM call, reviewer feedback, evaluation results.
 
 ```
-Broker pack ─► [ingest]   classify, OCR if needed             → doc.ingested
-              [parse]    segment into clauses, glossary       → doc.parsed
-              [index]    embed clauses to Azure AI Search     → doc.indexed
-              [compare]  for each clause: retrieve standard /
-                         red-lines / prior approvals, judge,
-                         persist finding                      → finding.created
-              [review]   underwriter accepts/edits/rejects    → review.captured
-              [learn]    feedback → SQL → eval + rubric updates
+                         ┌──── Part A: KB build (event-driven, idempotent) ────┐
+   Standard wording  ─┐  │                                                     │
+   Red-lines         ─┼─▶│ ingest → parse → upsert Mongo + Search → register   │─┐
+   Prior approvals   ─┘  │                                                     │ │
+                         └─────────────────────────────────────────────────────┘ │
+                                       ▲                                         ▼
+                                       │                              ┌──────────────────┐
+                          promote: signed-off                         │   Knowledge Base │
+                          submission → prior approval                 │ (Mongo + Search) │
+                                       │                              └──────────────────┘
+                                       │                                         ▲
+                         ┌──── Part B: Submission review ─────────┐              │
+   Broker pack       ─▶ │ parse → pin kb_snapshot_id →            │              │
+                        │   retrieve(3 queries/clause) →          │──────────────┘
+                        │   judge → finding → UI                  │
+                        │                       ↑                 │
+                        │       underwriter feedback (incl. sign-off → promote)
+                        └─────────────────────────────────────────┘
 ```
 
-Kafka gives us retry, replay, and back-pressure for free, and lets the UI stream partial findings as they arrive instead of waiting for the whole pack. **MVP** runs the stages synchronously per submission (Kafka topics in place but with one consumer each) and uses a single LLM judge prompt. **Target state** adds specialist judges per red-line category, a cheap clause-classifier that filters obvious clauses out before the strong judge, and active learning over reviewer disagreements.
+**MVP** runs Part B synchronously per submission with one strong LLM judge prompt. **Target state** routes by clause type — cheap classifier filters obvious clauses, specialist judges run per red-line category, active learning over reviewer disagreements.
 
-## 3. Document parsing, segmentation, normalisation
+---
 
-Every input — broker base wording, endorsements, schedule, standard wording, red-line spreadsheet, prior approvals — is normalised into a single `Clause` record: `{clause_id, doc_id, doc_type, heading_path, text, span (page + char offsets), checksum}`. Span offsets are mandatory: every downstream citation re-derives the quote from the source so we can verify it survived round-tripping.
+## Part A — Knowledge Base build
 
-- **DOCX:** parse OOXML directly rather than via OCR. Heading levels (`w:pStyle`) drive primary segmentation; run-level styling marks defined terms which feed a per-document glossary. Red-line spreadsheet rows are ingested as `{category, narrative}` records keyed by region + LoB.
-- **PDF / scanned:** Azure Document Intelligence layout model; pages below 0.9 word confidence go to manual triage rather than being fed to retrieval — a noisy clause produces a confident-looking wrong finding.
-- **Defined-term scoping:** the broker's `Insured` is not the standard's `Insured`. We attach the source document's glossary to each clause so the comparator never compares definitions across scopes.
-- **Schedule parsing:** the submission schedule becomes a typed record (Limit, Territory, Retroactive Date, requested features). **Line of business is inferred**, not parsed — the brief deliberately blanks the field. A constrained-output LLM call against an allow-list (`UK Tech PI`, `D&O`, …) reads business description + requested features and returns LoB plus confidence. Low confidence → underwriter prompt before the rest of the pipeline runs.
+The KB is **continuously updated**, not built once. New prior approvals arrive frequently (every underwriting sign-off can produce one), red-lines are tightened or added as governance evolves, and standard wordings are revised periodically. The design treats this as a first-class property: ingestion is event-driven, idempotent, versioned, and never leaves partial state visible to readers (see §6).
 
-## 4. Clause-level comparison
+Three document classes; each has a typed representation, a Mongo collection, and an AI Search index. They are kept logically separate because their filter schemas and consequences differ.
 
-For each broker clause we retrieve its closest standard-wording analogue and ask a judge LLM whether they materially diverge. Retrieval is hybrid (BM25 + dense embeddings) in Azure AI Search, with two channels run in parallel:
+### 3. Standard wording
 
-- **Topic anchor:** heading/topic match (Defence Costs, Insured, Notification). Catches cases where text differs heavily but topic is obvious.
-- **Semantic span:** clause-body match against the standard corpus. Catches structural reshuffles — e.g. a defence-costs rule embedded inside a definitions clause.
+- **Source:** insurer's canonical position per LoB × region × version (`05_Standard_Wording_UK_TechPI.docx`).
+- **Ingest:** OOXML parse → segment by numbered headings → produce `Clause` records `{clause_id, doc_id, lob, region, version, heading_path, text, span, defined_terms}`. Defined terms (capitalised in the OOXML) are extracted into a per-document glossary so downstream comparison knows that the broker's *Insured* and our *Insured* are not the same object.
+- **Store:** Mongo `standard_clauses`; AI Search index over text (vector + BM25) with `lob`, `region`, `version` as filterable facets.
+- **Versioning:** every standard wording is `(lob, region, version)`. Old versions are retained — past submissions must be reviewable against the version current at submission time, not against today's.
 
-The judge receives both clauses verbatim and returns `{material_divergence | immaterial_drafting | equivalent}`, a one-sentence rationale, and the **quoted phrase** responsible. Endorsements are applied **after** base comparison: if Endorsement 04 affirms cyber cover, the §8 base finding is re-evaluated against the endorsed position rather than reported alongside. Order-of-precedence is itself parsed from the broker wording rather than hard-coded, because brokers vary on this.
+### 4. Red-lines
 
-## 5. Red-line detection
+- **Source:** narrative absolute positions, one per row (`06_Red_Lines_UK_TechPI.xlsx`).
+- **Ingest:** parse spreadsheet → one record per row `{red_line_id, lob, region, category, narrative}`.
+- **Store:** Mongo `red_lines`; AI Search index over `narrative` with `lob`, `region`, `category` as filters.
+- **Design choice — narrative stays narrative.** We deliberately do **not** translate red-lines into deterministic rules. "*No catch-all language to automatically allow cover for either: (i) companies which are not legally defined…*" carries judgement that disappears in a regex. Categories (Insured Definition, Defence Costs, Cyber/Privacy/Media, Territory, Contractual Liability, Prior Acts/Acquisitions) become retrieval facets, not rule keys.
 
-Red-lines are narrative ("No catch-all language to automatically allow cover for either: (i) companies which are not legally defined…"). We deliberately do **not** translate them to deterministic rules — the narrative carries judgement that disappears in a regex. Each red-line is indexed as an embedded statement with its category tag. For each broker clause:
+### 5. Prior approvals
 
-1. Retrieve top-k red-lines by hybrid search, hard-filtered to the same region + LoB.
-2. Pass clause + candidate red-line to a judge that must answer *did this clause violate this red-line, and what exact phrase shows it*.
-3. Surface the finding only with verbatim evidence; never without.
+This is the highest-risk index — wrong retrieval here produces fabricated precedent. Designed conservatively.
 
-Red-line judgements live alongside, not inside, standard-wording divergences. They have different consequences — a red-line breach is an escalation, a drafting divergence is a discussion — and both can fire on the same clause.
+- **Source:** previously approved broker wordings per insured (`07_Prior_Approval_Orion.docx`, `08_Prior_Approval_Helix.docx`).
+- **Ingest:** parse the structured header into typed metadata (`reference`, `lob`, `region`, `insured`, `approval_date`, `approved_by`, `status`, `underwriting_note`); parse approved clauses as sub-records `{clause_id, approval_id, heading_path, text, span}`.
+- **Store:** Mongo `prior_approvals` with parent record + sub-collection of clauses; AI Search index over approved-clause text with filters `lob`, `region`, `approval_date`, `insured_size_band` (where known), `status`.
+- **Underwriting note as typed field.** The note ("*This approval relates to a D&O policy and is not transferable to a Tech PI risk without separate underwriting review*") is captured as structured metadata, not just embedded prose. The ranker uses it directly to demote and the UI surfaces it verbatim.
 
-## 6. Prior-approval retrieval and ranking
+### 6. Updates and re-indexing
 
-The highest-risk surface for hallucination. Two hard rules: (a) nothing is cited unless it came back from the search index — the LLM cannot invent an approval ID, validated by post-hoc lookup; (b) the ranking signal is **transferability**, not surface similarity. We score candidates on:
+The three document classes update on independent cadences — the system handles them through one pathway and does not need to know the cadence in advance.
 
-- **LoB match** (hard filter — different LoB never qualifies as precedent, but is surfaced separately as "similar text — different line of business" so the underwriter sees we considered and rejected it).
-- **Region / jurisdiction match.**
-- **Clause-text semantic similarity.**
-- **Narrowness:** does the approved clause grant *less or equal* scope than the broker is requesting? A precedent narrower than the request is partial, not green-light.
-- **Insured-size band and recency** when known.
+| Update | Frequency in practice | Source | Risk profile |
+|---|---|---|---|
+| New prior approval | High (per sign-off) | Auto-promotion from Part B, or manual upload | Low — additive; past findings unaffected |
+| Red-line modified / added | Medium (governance) | Underwriting governance | High — may invalidate in-flight submissions |
+| Standard wording revised | Low (annual+) | Insurer policy team | Medium — versioned; past submissions pinned to old version |
 
-The judge then returns relevance score, why, what's narrower, what's broader — quoting the differing phrases. This is what catches the Helix-D&O precedent being misapplied to Tech PI: LoB filter demotes it, and the rationale names the mismatch explicitly.
+**One ingestion path, idempotent.** Every update — whether a freshly authored red-line, a revised standard wording, or a signed-off submission being promoted — flows through the same path: Blob upload (content-hashed key, so re-uploads dedupe) → Kafka `kb.doc.received` → classify → parse → **upsert** Mongo and AI Search → SQL doc-registry transitions `received → parsed → indexed → live` → emit `kb.doc.indexed`. The `live` flip is the visibility boundary; partial state is never readable. A re-upload of unchanged content is a no-op.
 
-## 7. Findings: evidence, source, confidence
+**Promotion loop — Part B feeds Part A.** When an underwriter signs off a broker wording (all findings resolved, submission bound), the system emits the approved version to the KB ingestor with structured metadata: `insured`, `lob`, `region`, `approval_date`, `approved_by`, and the underwriting note authored during review. This is the closed loop that grows the precedent corpus without a separate export process. Crucially, the metadata is captured at the moment of sign-off — no post-hoc reconstruction.
 
-Every finding is persisted before render, matching the brief's schema:
+**Snapshot pinning for in-flight submissions.** Every submission binds at parse time to a `kb_snapshot_id` — a digest over every live `(doc_id, version)` in the KB at that instant. Findings are computed against that snapshot. If a red-line is tightened or a new prior approval lands while a submission is mid-review, the reviewer's findings do **not** silently change underneath them. The UI offers a "re-run against latest KB" action that produces a *diff* of findings (added / removed / changed), not a replacement. Audit stays clean: every finding is reproducible against the KB version it was computed against.
+
+**Proactive notification on red-line changes.** When a red-line is added or tightened, we compute which in-flight submissions *would* gain findings under the new red-line and notify the relevant underwriters via Teams/email with the diff. Waiting for someone to click "re-run" would miss the change.
+
+**Re-indexing without downtime.** Per-document upserts are the default. For breaking changes (embedding model upgrade, schema migration) we build the new AI Search index alongside the live one, replay the SQL doc registry into it, then atomically swap the index alias. Readers never see a partially-built index. The doc registry is the source of truth — the AI Search index is fully rebuildable from it.
+
+**Parsing failures fail loud.** PDFs below 0.9 word-confidence (common for scanned prior approvals) route to manual triage rather than being parsed best-effort; the registry status `parse_failed` makes them visible at a glance. Garbage text produces confident-looking wrong findings — failing at ingest is much cheaper than catching it at review.
+
+---
+
+## Part B — Submission review
+
+### 7. Parsing the broker pack
+
+Same `Clause` normalisation as the KB, plus:
+
+- **Schedule** → typed record (Limit, Territory, Retroactive Date, requested features).
+- **LoB inference** when the Class field is blank (as in the supplied pack): constrained-output LLM call against an allow-list using business description + requested features. Low confidence prompts the underwriter before the pipeline fans out — this is load-bearing because every KB query is hard-filtered on LoB.
+- **Endorsements** become separate `Clause` records linked to the base wording with their order-of-precedence parsed from the broker's own wording (broker §10 in the pack), not hard-coded.
+
+### 8. Retrieval — three queries per clause
+
+For each broker clause we fire three retrieval calls against the KB, all hard-filtered on broker `lob` and `region`:
+
+| Query | Index | Top-k | Filters |
+|---|---|---|---|
+| Closest standard analogue | `standard_clauses` | 1–3 | `lob`, `region`, `version=current` |
+| Candidate red-lines | `red_lines` | ≤5 | `lob`, `region` |
+| Candidate prior approvals | `prior_approvals` | ≤5 | `lob`, `region`, `status=active` |
+
+All three are hybrid (dense vector + BM25). The standard-analogue query runs in two channels in parallel — **topic anchor** (heading match: "Defence Costs" → "Defence Costs") for the common case, and **semantic span** for when the broker has reshuffled structure (e.g. embedded a defence-costs rule inside §2 Definitions).
+
+In **addition** to the hard-filtered prior-approval query, we run a parallel **cross-LoB lookup** with the LoB filter relaxed. Results are surfaced separately in the UI as "similar wording in other lines of business — not treated as precedent" so the underwriter sees that Helix-style near-matches were considered and rejected, rather than the system silently dropping them.
+
+### 9. LLM judgement
+
+Three judges, each receiving the broker clause plus the retrieved candidate verbatim, each returning a structured response with a **quoted phrase from the source** as evidence:
+
+- *Divergence judge* → `{material_divergence | immaterial_drafting | equivalent}` + rationale + quoted phrase.
+- *Red-line judge* → `{violates | does_not_violate}` + which red-line + quoted phrase.
+- *Precedent relevance judge* → `{transferable | partial | not_transferable}` + what's narrower + what's broader.
+
+Endorsements are applied **after** base comparison: if Endorsement 04 affirms cyber cover, the §8 base finding is re-evaluated under the endorsed position rather than reported alongside. A "suppressed by endorsement" trace is kept so nothing silently disappears.
+
+Two hard rules on prior approvals: (a) nothing can be cited unless its `approval_id` was returned by the retriever — post-hoc lookup verifies; (b) different LoB never qualifies as transferable precedent (LoB filter), but is shown via the cross-LoB lookup with the mismatch named.
+
+### 10. Findings: evidence, source, confidence
+
+Every finding persists before render, in the brief's schema:
 
 ```
 finding_id · clause_id · issue_type · why_it_matters ·
@@ -81,11 +147,9 @@ quoted_evidence · prior_approval (id + transferability + delta) ·
 recommended_action · confidence · model_version · prompt_hash
 ```
 
-Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: we re-extract the quoted phrase from the source by exact match and reject the finding if not found verbatim. This single gate removes most hallucinations cheaply.
+Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: the quoted phrase is re-extracted from the source by exact match, and the finding is rejected if not found verbatim. This single gate removes most hallucinations cheaply.
 
-## 8. Worked example — Defence Costs
-
-The pipeline produces this finding from the supplied pack:
+### 11. Worked example — Defence Costs
 
 | Field | Value |
 |---|---|
@@ -93,40 +157,40 @@ The pipeline produces this finding from the supplied pack:
 | Standard analogue | §3 *"Defence Costs form part of and not in addition to the Limit of Indemnity."* |
 | Issue type | Material divergence + **Red-line breach (RL-03)** |
 | Why it matters | Defence costs outside the limit can materially exceed the priced exposure; explicit insurer red-line for UK Tech PI. |
-| Prior approval | **Helix-UK-DO-2023-041 — not transferable.** Surface-similar (advancement in addition to limit) but LoB = D&O, not Tech PI. Flagged "similar text, different LoB" rather than dropped silently. |
-| Recommended action | Revert to standard wording, or escalate; do not rely on Helix. |
+| Prior approval | **Helix-UK-DO-2023-041 — not transferable.** Returned by the cross-LoB lookup (surface-similar — advancement in addition to limit) but LoB = D&O. Shown as "similar wording in other lines of business", not as precedent. |
+| Recommended action | Revert to standard wording or escalate; do not rely on Helix. |
 | Confidence | 0.92 — verbatim quote, RL-03 directly applicable, retrieval clean. |
 
-A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities). Here **Orion** is genuinely Tech PI and genuinely on-topic — but Orion *excludes* prior acts and caps at 15% turnover / 60-day notification, where the broker grants prior acts at 35% / 120 days. Orion is returned as a **narrower precedent**, with the deltas itemised — not as a green light. This is the precedent-relevance behaviour the brief is testing.
+A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities). Here **Orion** is genuinely Tech PI and on-topic — but Orion *excludes* prior acts and caps at 15% turnover / 60-day notification, where the broker grants prior acts at 35% / 120 days. Orion is therefore returned as a **partial precedent** with deltas itemised, not a green light.
 
-## 9. UX for the underwriter
+---
 
-A three-pane review screen: submission schedule and finding list on the left; the broker document (with each finding highlighting a span) in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". The underwriter can pivot a finding from standard-divergence to red-line-breach (or vice versa) — this is a strong feedback signal we record verbatim.
+## 12. UX for the underwriter
 
-Feedback *shape* matters more than volume. A reject reason of "wrong precedent" trains a different model than "rationale incorrect"; both are different from "this is fine actually". Five explicit reject reasons plus free-text, and edits to the recommended-action field are first-class training data.
+Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
 
-## 10. Evaluation
+Feedback *shape* matters more than volume. "Wrong precedent" trains a different model than "rationale incorrect"; both differ from "this is fine actually". Five explicit reject reasons plus free-text; edits to the recommended-action field are first-class training data.
 
-**Offline.** Curated gold set of ~150 broker clauses spanning the eight document families, each labelled with expected findings. Metrics: clause-level **recall** (did we surface every real issue?), **precision**, **evidence accuracy** (quoted span exact-matches the source?), and **precedent F1** split by transferable/non-transferable. Evidence accuracy is the dominant metric — precision/recall are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
+## 13. Evaluation
 
-**Online.** Reviewer accept-rate per finding type, time-to-decision, post-bind incident rate, false-negative discovery rate (issues the model missed that surfaced at claims). Shadow-run every new prompt or model against the last N submissions before promotion.
+**Offline.** Curated gold set of ~150 broker clauses across the eight document families, each labelled with expected findings. Metrics: clause-level **recall**, **precision**, **evidence accuracy** (quoted span exact-matches the source), and **precedent F1** split by transferable/partial/not-transferable. Evidence accuracy is the dominant metric — recall and precision are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
 
-**Test design.** Adversarial corpus baked in: structural reshuffles (defence-costs rule hidden inside §2 Definitions), defined-term shadowing (broker redefining `Insured`), endorsements that fully override base wording (Endorsement 04 affirming cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are *narrower* than the request (the Orion trap). CI gates promotion on no-regression in evidence accuracy and recall on red-line breaches.
+**Online.** Reviewer accept-rate per finding type, time-to-decision, post-bind incident rate, false-negative discovery rate. Shadow-run every new prompt or model against recent submissions before promotion.
 
-## 11. Security, audit, monitoring
+**Adversarial corpus baked into CI:** structural reshuffles (rule hidden inside Definitions), defined-term shadowing, endorsements that fully override base wording (Endorsement 04 cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are narrower than the request (the Orion trap). Promotion gated on no-regression in evidence accuracy and red-line recall.
 
-Blob Storage with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to Azure SQL — this is the audit trail *and* the evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII in submissions (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC: prior approvals are insurer-confidential — the index enforces tenant + role at query time, not at render time.
+## 14. Security, audit, monitoring
 
-Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate against historical reviewer decisions. Alerts on regression of evidence accuracy in shadow runs.
+Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC enforced at AI Search query time — prior approvals are insurer-confidential and tenant + role filters cannot be bypassed at render.
 
-## 12. Risks, trade-offs, MVP→target
+Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of evidence accuracy in shadow runs.
 
-- **Hallucinated precedents** — highest-impact failure mode. Mitigated by hard-grounded retrieval, verbatim-quote requirement, LoB filter, and adversarial Helix-style tests in CI.
-- **Endorsement override missed** — Mitigated by parsing order-of-precedence and replaying base findings under endorsements; surface a "suppressed by endorsement" trace rather than silently dropping a finding.
-- **Variable broker formats break the parser** — Mitigated by OCR confidence gate that routes low-confidence pages to manual triage rather than feeding garbage to retrieval.
-- **Reviewer over-trust** — Mitigated by no-auto-accept, surfacing retrieval evidence and confidence components separately rather than a single score, and showing what the model *didn't* find that the gold set says it should have during eval.
-- **Cost** — MVP runs one strong judge per clause. Target state routes by clause type: a cheap classifier handles obviously-equivalent clauses (the majority), the strong judge runs only on retrieved-divergence candidates.
+## 15. Risks, trade-offs, MVP → target
 
-**MVP → target deltas.** Replace the single judge with specialist judges per red-line category; train a clause-classifier on accumulated reviewer labels so cheap clauses skip the LLM entirely; add a precedent-graph view so underwriters see *why* one approval is closer than another rather than a relevance number; introduce active learning over reviewer disagreements to surface clause types where the model and humans drift.
+- **Hallucinated precedents** — mitigated by hard-grounded retrieval (no citation without retriever-returned ID), verbatim-quote requirement, LoB filter, adversarial Helix-style tests in CI.
+- **Endorsement override missed** — mitigated by parsing order-of-precedence and replaying base findings under endorsements; "suppressed by endorsement" trace rather than silent drop.
+- **Variable broker formats break the parser** — mitigated by OCR confidence gate at ingest.
+- **Reviewer over-trust** — mitigated by no auto-accept, surfacing retrieval evidence and confidence components separately rather than a single score, and reporting what the model *didn't* find that the gold set says it should have during eval.
+- **Cost** — MVP runs one strong judge per clause; target state routes by clause type so a cheap classifier handles obviously-equivalent clauses (the majority), strong judge only on retrieved-divergence candidates.
 
-**Things I'd do differently if I could.** The line-of-business inference at intake is structurally fragile — a single bad inference propagates to every downstream filter. In target state I'd surface LoB inference to the underwriter for one-click confirmation before the pipeline fans out, rather than treating it as silent metadata.
+**MVP → target deltas.** Specialist judges per red-line category; clause-classifier trained on accumulated reviewer labels; precedent-graph view showing *why* an approval is closer than another; active learning over reviewer disagreements; LoB inference surfaced for one-click confirmation rather than treated as silent metadata.
