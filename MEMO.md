@@ -15,6 +15,15 @@ The system never decides — it surfaces, explains, and routes. **Every review s
 
 ## 2. Architecture at a glance
 
+The architecture is **RAG with a multi-judge ensemble — not multi-agent.** Part A builds the retrieval index (standard wording, red-lines, prior approvals); Part B issues retrieval queries per broker clause and routes the retrieved spans to a small set of single-shot, constrained-output LLM judges (§10 divergence judge, §11 red-line and precedent-relevance judges). Each judge is stateless — structured input → structured JSON output, span-grounded against `text_raw`, persisted with `prompt_hash`. There is no agent loop, no tool-use, no inter-call planning, **by design**:
+
+- The review workflow is predictable — every broker clause needs the same three retrievals and the same judge set, so there is no "what to do next?" question for an agent to plan around.
+- Determinism is mandated by the brief's audit-trail constraint — a bounded pipeline replays exactly (same prompts + same retrieved `doc_id`s → same finding); an agent that decides adaptively what to retrieve or which tool to call does not.
+- Hallucination surface is smaller — each agent reasoning step and tool-call decision is another place a fabricated claim can leak in, harder to gate than a single span-grounded JSON output.
+- Cost is bounded — ~4 LLM calls per matched clause vs. high-variance agent loops.
+
+Multi-agent patterns are reserved for bounded **target-state** subtasks, none load-bearing for MVP review: (i) preparing an escalation packet when a reviewer clicks *escalate* (gather related submissions, similar past escalations, model decision history); (ii) an offline tuning loop that ingests reviewer disagreements, proposes prompt / retriever-weighting changes, and validates them against the gold set before opening a PR.
+
 Both pipelines run on AKS with services communicating over Kafka. Shared substrate:
 
 - **Blob Storage** — raw documents, immutable, content-hashed.
