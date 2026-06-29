@@ -192,19 +192,92 @@ All three are hybrid (dense vector + BM25). The standard-analogue query runs in 
 
 In **addition** to the hard-filtered prior-approval query, we run a parallel **cross-LoB lookup** with the LoB filter relaxed. Results are surfaced separately in the UI as "similar wording in other lines of business — not treated as precedent" so the underwriter sees that Helix-style near-matches were considered and rejected, rather than the system silently dropping them.
 
-### 10. LLM judgement
+### 10. Clause-level comparison
 
-Three judges, each receiving the broker clause plus the retrieved candidate verbatim, each returning a structured response with a **quoted phrase from the source** as evidence:
+The comparison pipeline sits between retrieval (§9) and finding production (§12). Four stages in order; output is one structured comparison record per broker × standard pair.
 
-- *Divergence judge* → `{material_divergence | immaterial_drafting | equivalent}` + rationale + quoted phrase.
-- *Red-line judge* → `{violates | does_not_violate}` + which red-line + quoted phrase.
-- *Precedent relevance judge* → `{transferable | partial | not_transferable}` + what's narrower + what's broader.
+**Stage 1 — Bipartite matching.** Build a similarity matrix over broker × standard candidates from the two-channel retrieval (heading-path anchor + body semantic), combining as `0.6·topic + 0.4·body`. Greedy assignment with a confidence threshold (≈ 0.5 in MVP, tuned against the gold set) produces three outcomes:
 
-Endorsements are applied **after** base comparison: if Endorsement 04 affirms cyber cover, the §8 base finding is re-evaluated under the endorsed position rather than reported alongside. A "suppressed by endorsement" trace is kept so nothing silently disappears.
+- *Matched pair* → goes to stages 2–4.
+- *Broker-only clause* (no standard analogue above threshold) → finding **"broker-introduced clause not in standard"** (e.g. broker §10 *Order of Precedence* — standard has no equivalent; broker §7 *Territory and Jurisdiction (Worldwide)* arguably also).
+- *Standard-only clause* (no broker analogue) → finding **"broker omitted standard coverage"**. Often the highest-exposure category — what the broker *didn't say* (e.g. standard §6 *Network Security ... unless a separate module is specifically underwritten* has no broker analogue restricting cyber; broker has affirmatively granted it).
+
+**Stage 2 — Defined-term reconciliation (deterministic, no LLM).** For each matched pair, look up the glossary entries for the terms each clause uses (`defined_terms_used` from §7). Diff scopes structurally:
+
+- Single-sentence definitions → token-level diff.
+- Compound definitions with sub-items → set diff over sub-clauses ((a), (b), (c)…) plus phrase-level diff within each sub-item.
+
+Output: a `defined_term_drift` record `{term, broker_scope, standard_scope, delta}`. Computed *before* the judge runs so the judge is told the underlying terms differ — preventing the common failure mode of comparing surface clause text while ignoring that *Insured* means different things on each side.
+
+**Stage 3 — Divergence judge (one LLM call, constrained JSON output).** Inputs:
+
+- Both clauses' `text` (normalised) and `heading_path`.
+- Glossary entries for the terms each clause uses.
+- The `defined_term_drift` record from stage 2.
+- The submission's `Submission` record (limit, territory, requested features) for context.
+
+Output schema:
+
+```json
+{
+  "verdict": "material_divergence | immaterial_drafting | equivalent",
+  "rationale": "...",
+  "broker_quote": "...",      // must exact-match broker.text_raw
+  "standard_quote": "...",    // must exact-match standard.text_raw
+  "divergence_axes": ["scope_of_insured", "automatic_extension"],
+  "self_confidence": 0.94
+}
+```
+
+Both quotes pass through the span-grounding gate — re-extract from `text_raw` by exact match. One retry, then `judgement_failed` → manual review.
+
+**Stage 4 — Endorsement layering.** After base comparison, the broker's own order-of-precedence clause (broker §10 in this pack) drives application of endorsements. For every base finding, if an endorsement touches the same `heading_path` topic, re-run the judge with the **effective wording** (base + endorsement overlay) against standard. The base finding is either preserved with updated evidence spans, downgraded to `equivalent` (if the endorsement narrowed the broker side to match standard — rare), or its rationale upgraded (if the endorsement widened the gap). An "applied endorsement X" trace is persisted regardless, so nothing silently disappears.
+
+#### Worked example — §2.1 *Insured* definition
+
+(The Defence Costs example in §13 covers a body-only divergence with cross-LoB precedent. This one exercises defined-term reconciliation and endorsement layering, which Defence Costs doesn't.)
+
+**Stage 1 — matching.** Broker `BRG-§2.1` `heading_path = ["2. DEFINITIONS", "2.1 Insured"]`. Topic-anchor channel returns `STD-§2.1` at cosine 0.98 on heading; body-semantic channel returns the same clause at cosine 0.71 (bodies diverge — that's the signal). Combined 0.87 → matched pair.
+
+**Stage 2 — defined-term reconciliation:**
+
+| | Broker `Insured` | Standard `Insured` |
+|---|---|---|
+| (a) | Named Insured | Named Insured |
+| (b) | "*any past, present or future subsidiary, associated company, joint venture, or other entity over which the Named Insured exercises management control*" | "*any subsidiary entity wholly owned by the Named Insured at inception and specifically declared to the Insurer*" |
+| (c) | "*any director, officer, partner, member or employee of any entity falling within paragraphs (a) or (b)*" | — |
+
+`defined_term_drift`: broker adds *associated company* (not a legally defined form), *joint venture*, *over which exercises management control* (catch-all), *past/present/future* temporal extension, plus individual officers/employees; broker removes *wholly owned* and *specifically declared* constraints.
+
+**Stage 3 — judge output:**
+
+```json
+{
+  "verdict": "material_divergence",
+  "rationale": "Broker introduces unbounded catch-all language ('associated company', 'over which exercises management control') and temporal extension ('past, present or future') absent from the standard, and removes the 'wholly owned at inception' and 'specifically declared' constraints. Standard limits Insured to declared wholly-owned subsidiaries; broker captures effectively any related entity automatically.",
+  "broker_quote": "any past, present or future subsidiary, associated company, joint venture, or other entity over which the Named Insured exercises management control",
+  "standard_quote": "any subsidiary entity wholly owned by the Named Insured at inception and specifically declared to the Insurer",
+  "divergence_axes": ["scope_of_insured", "automatic_extension"],
+  "self_confidence": 0.94
+}
+```
+
+Both quotes exact-match their `text_raw`. Span gate passes.
+
+**Stage 4 — endorsement layering.** Endorsement 01 (Acquired Entities) further modifies `Insured` by adding "*any entity acquired or formed during the Period of Insurance where the annual turnover of such entity does not exceed 35% of consolidated group turnover*". Broker §10 makes the endorsement override the base. The judge re-runs against the effective wording (base + Endorsement 01) and the verdict stays `material_divergence`; the rationale and evidence spans now reference both the base catch-all *and* the 35%-turnover sub-rule.
+
+**Downstream — one clause, two findings.** This comparison feeds the divergence finding in §12. In parallel (§11), the red-line query against the same clause retrieves **RL-01** ("*No catch-all language to automatically allow cover for either: (i) companies which are not legally defined (e.g. 'associated companies')…*"). The red-line judge fires on the phrases *"associated company"* and *"over which exercises management control"* — direct match. Two findings on the same `broker_quote`: one divergence, one red-line breach.
+
+### 11. Red-line and precedent judges
+
+Two further judges run alongside the divergence judge (§10), on the other two retrieval channels from §9. Same constrained-JSON shape, same span-grounding gate (re-extract from `text_raw` by exact match, retry once, then `judgement_failed`):
+
+- *Red-line judge* → `{violates | does_not_violate}` + which red-line + quoted phrase from the broker clause + quoted phrase from the red-line narrative.
+- *Precedent relevance judge* → `{transferable | partial | not_transferable}` + what's narrower + what's broader + quoted phrases from both clauses.
 
 Two hard rules on prior approvals: (a) nothing can be cited unless its `approval_id` was returned by the retriever — post-hoc lookup verifies; (b) different LoB never qualifies as transferable precedent (LoB filter), but is shown via the cross-LoB lookup with the mismatch named.
 
-### 11. Findings: evidence, source, confidence
+### 12. Findings: evidence, source, confidence
 
 Every finding persists before render, in the brief's schema:
 
@@ -217,7 +290,7 @@ recommended_action · confidence · model_version · prompt_hash
 
 Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: the quoted phrase is re-extracted from `text_raw` by exact match, and the finding is rejected if not found verbatim. This single gate removes most hallucinations cheaply.
 
-### 12. Worked example — Defence Costs
+### 13. Worked example — Defence Costs
 
 | Field | Value |
 |---|---|
@@ -233,13 +306,13 @@ A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities
 
 ---
 
-## 13. UX for the underwriter
+## 14. UX for the underwriter
 
 Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
 
 Feedback *shape* matters more than volume. "Wrong precedent" trains a different model than "rationale incorrect"; both differ from "this is fine actually". Five explicit reject reasons plus free-text; edits to the recommended-action field are first-class training data.
 
-## 14. Evaluation
+## 15. Evaluation
 
 **Offline.** Curated gold set of ~150 broker clauses across the eight document families, each labelled with expected findings. Metrics: clause-level **recall**, **precision**, **evidence accuracy** (quoted span exact-matches the source), and **precedent F1** split by transferable/partial/not-transferable. Evidence accuracy is the dominant metric — recall and precision are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
 
@@ -247,13 +320,13 @@ Feedback *shape* matters more than volume. "Wrong precedent" trains a different 
 
 **Adversarial corpus baked into CI:** structural reshuffles (rule hidden inside Definitions), defined-term shadowing, endorsements that fully override base wording (Endorsement 04 cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are narrower than the request (the Orion trap). Promotion gated on no-regression in evidence accuracy and red-line recall.
 
-## 15. Security, audit, monitoring
+## 16. Security, audit, monitoring
 
 Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC enforced at AI Search query time — prior approvals are insurer-confidential and tenant + role filters cannot be bypassed at render.
 
 Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of evidence accuracy in shadow runs.
 
-## 16. Risks, trade-offs, MVP → target
+## 17. Risks, trade-offs, MVP → target
 
 - **Hallucinated precedents** — mitigated by hard-grounded retrieval (no citation without retriever-returned ID), verbatim-quote requirement, LoB filter, adversarial Helix-style tests in CI.
 - **Endorsement override missed** — mitigated by parsing order-of-precedence and replaying base findings under endorsements; "suppressed by endorsement" trace rather than silent drop.
