@@ -15,7 +15,7 @@ The system never decides — it surfaces, explains, and routes. **Every review s
 
 ## 2. Architecture at a glance
 
-The architecture is **RAG with a multi-judge ensemble — not multi-agent.** Part A builds the retrieval index; Part B issues retrieval queries per broker clause and routes the retrieved spans to a small set of stateless, constrained-output LLM judges (§10, §11). Rationale, alternatives, and what we give up are in §17 D1.
+The architecture is **RAG with a multi-judge ensemble — not multi-agent.** We'll explain this decision in §17 D1. Part A builds the knowledge base and the retrieval index; Part B issues retrieval queries per broker clause and routes the retrieved spans to a small set of stateless, constrained-output LLM judges (§10, §11).
 
 Both pipelines run on AKS with services communicating over Kafka. Shared substrate:
 
@@ -44,8 +44,6 @@ Both pipelines run on AKS with services communicating over Kafka. Shared substra
                         │       underwriter feedback (incl. sign-off → promote)
                         └─────────────────────────────────────────┘
 ```
-
-**MVP** runs Part B synchronously per submission with one strong LLM judge prompt. **Target state** routes by clause type — cheap classifier filters obvious clauses, specialist judges run per red-line category, active learning over reviewer disagreements.
 
 **The supplied pack, mapped to the architecture.** The case-study inputs split cleanly across the two pipelines:
 
@@ -274,12 +272,10 @@ Both quotes exact-match their `text_raw`. Span gate passes.
 
 ### 11. Red-line and precedent judges
 
-Two further judges run alongside the divergence judge (§10), on the other two retrieval channels from §9. Same constrained-JSON shape, same span-grounding gate (re-extract from `text_raw` by exact match, retry once, then `judgement_failed`):
+Two further judges run alongside the divergence judge (§10), on the other two retrieval channels from §9. Both follow the same constrained-JSON contract and span-grounding gate as §10 stage 3:
 
 - *Red-line judge* → `{violates | does_not_violate}` + which red-line + quoted phrase from the broker clause + quoted phrase from the red-line narrative.
 - *Precedent relevance judge* → `{transferable | partial | not_transferable}` + what's narrower + what's broader + quoted phrases from both clauses.
-
-Two hard rules on prior approvals: (a) nothing can be cited unless its `approval_id` was returned by the retriever — post-hoc lookup verifies; (b) different LoB never qualifies as transferable precedent (LoB filter), but is shown via the cross-LoB lookup with the mismatch named.
 
 ### 12. Findings — source-grounded citation
 
@@ -334,7 +330,7 @@ A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities
 
 ## 14. UX for the underwriter
 
-Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. **Every citation in a finding renders as a clickable chip** that scrolls the relevant source pane to the cited span and highlights it; chip labels show the role (`std §3`, `RL-03`, `Helix §1`) so the underwriter can audit a claim without reading prose. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
+Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. **Every citation in a finding renders as a clickable chip** that scrolls the relevant source pane to the cited span and highlights it; chip labels show the role (`std §3`, `RL-03`, `Helix §1`) so the underwriter can audit a claim without reading prose. If a citation's source isn't readable by the current viewer (e.g. a prior approval restricted to a different team — §16), the chip renders as `Helix §1 — restricted` and clicking opens an access-request flow without exposing the underlying span. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
 
 Feedback *shape* matters more than volume. "Wrong precedent" trains a different model than "rationale incorrect"; both differ from "this is fine actually". Five explicit reject reasons plus free-text; edits to the recommended-action field are first-class training data.
 
@@ -348,9 +344,32 @@ Feedback *shape* matters more than volume. "Wrong precedent" trains a different 
 
 ## 16. Security, audit, monitoring
 
-Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC enforced at AI Search query time — prior approvals are insurer-confidential and tenant + role filters cannot be bypassed at render.
+**Authentication.** Users sign in via Azure Entra ID; group memberships and attributes flow as claims to the application. Service-to-service calls (ingestor → AI Search, Part B retriever → AI Search, Part B → Azure OpenAI) use managed identities scoped to least privilege — the ingestor has write-only access to its target indexes; the retriever has read-only. No API keys in code or config.
 
-Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of citation accuracy in shadow runs.
+**Authorization model — who can see what.** Not all insurer staff can read all insurer-confidential documents (e.g. prior approvals 07/08 marked "*STRICTLY CONFIDENTIAL — INSURER INTERNAL USE ONLY*"). Different document classes have different default visibility, parameterised on different restriction dimensions:
+
+| Document class | Default visibility | Restriction dimensions |
+|---|---|---|
+| Standard wording | Underwriting staff for the LoB | LoB |
+| Red-lines | Underwriting staff for the LoB | LoB |
+| Prior approvals | Underwriting team for the approval's LoB × region | LoB, region, sensitivity tier, conflict ring-fence |
+| Broker pack under review | Underwriting team for that submission + their lead | `submission_id` ACL |
+| Findings | Same as the submission they belong to | `submission_id` ACL |
+| Audit log | Compliance + admins only | role |
+
+Prior approvals carry a `sensitivity_tier` (default / restricted / committee-only) set at ingestion. Committee-only approvals need explicit per-user grants. Insured-conflict ring-fences (ethical walls between deal teams on competing insureds) are modelled as exclusion ACLs at the prior-approval document level.
+
+**Authorization is enforced at the retrieval boundary, not at render** (see §17 D4 for the choice rationale). User permissions are applied as **query-time security filters in Azure AI Search**, not as post-hoc filtering of returned results. Every retrieval call (§9 three queries, the cross-LoB lookup) is parameterised with the caller's `principal_id`; the AI Search security filter excludes documents the principal isn't entitled to *before* results return. Restricted documents therefore **never enter the LLM context window** — the LLM cannot paraphrase or leak what it never saw.
+
+**Cross-LoB visibility.** The §9 cross-LoB panel runs through a *separate metadata-only retrieval path* that bypasses the content security filter — it returns LoB, approval reference, similarity score, and the underwriting note's "not transferable" flag, never the underlying clause text. A *request access* action routes to the document's owning team for one-time disclosure when the underwriter wants the content itself.
+
+**Document-level access audit.** Every retrieval logs `{user_principal, query, applied_filters, retrieved_doc_ids, restricted_doc_ids_filtered_out}` to SQL — this is the compliance answer to "who saw what, when, why." Citation clicks in the UI are logged separately (who clicked through to which span, when). Both audit streams are queryable in the compliance schema with their own role gates.
+
+**LLM-call audit (unchanged from prior version).** Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible.
+
+**Other properties.** Blob with per-tenant CMK encryption. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it — with one exception: prior-approval transferability scoring needs the insured name (size-band match, conflict check), so it goes through with explicit logging.
+
+**Monitoring.** Cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions, **unauthorized-retrieval-attempt rate** (queries that would have hit a restricted doc and were filtered — a security signal worth alerting on). Alerts on regression of citation accuracy in shadow runs and on spikes in restricted-doc access attempts.
 
 ## 17. Design decisions and tradeoffs
 
@@ -376,6 +395,13 @@ Three choices shaped the architecture. Each had a credible alternative; surfacin
 - *Alternative considered.* Soft demotion via score weighting — keep cross-LoB matches in the same retrieval ranking but multiply their relevance by, say, 0.3.
 - *Why we chose this.* The Helix trap (D&O defence-costs advancement misread as Tech PI precedent) is exactly what soft demotion fails to catch: when surface text similarity is high (the in-addition-to-limit phrasing is nearly identical), a 0.3× multiplier doesn't reliably push it below a legitimate same-LoB match, and the LLM is then asked to make a binary keep/discard call it shouldn't be making. The hard filter makes the decision in code where it's auditable, not in the model where it's variable.
 - *What we give up.* A legitimately transferable cross-LoB precedent (rare but possible — e.g. a generic "knowledge of circumstances" carve-out that holds across PI lines) would be hidden from the citations list. Mitigation: the cross-LoB panel keeps it visible to the underwriter, who can promote it manually with a reason recorded as feedback — and that promotion is itself training signal.
+
+**D4. Authorization enforced at the retrieval boundary — not at render.**
+
+- *Chosen.* User permissions are applied as Azure AI Search query-time security filters; restricted documents (e.g. a prior approval the viewer's team isn't entitled to read) never enter the LLM context (§16).
+- *Alternative considered.* Run retrieval against the full index, pass everything to the LLM, then filter the finding's citations at render time against the user's permissions — simpler to implement (one global retrieval policy, no per-query filter, easier caching).
+- *Why we chose this.* If unauthorized content reaches the LLM context window, the model's generated `rationale` or `recommended_action` can paraphrase or reference it even when the UI later omits the citation. Render-time citation filtering protects the citations list but not the surrounding prose. A retrieval-time filter is the only way to *guarantee* the LLM never sees what the user isn't entitled to see — concretely, if a Tech PI underwriter's retrieval pulled Helix's D&O content into the judge's context, the divergence-judge's rationale could paraphrase Helix's defence-costs phrasing even if Helix is later removed from citations.
+- *What we give up.* Slightly more complex retrieval (every query carries the user principal; cache keys must include it, which lowers cache hit rate). The cross-LoB panel needs a *separate* metadata-only retrieval path because surfacing existence requires bypassing the content filter while still hiding the content itself. Both are manageable.
 
 ## 18. Risks, trade-offs, MVP → target
 
