@@ -11,7 +11,7 @@ For every broker clause an underwriter must answer four questions: does it diver
 - **Part A — Knowledge Base build.** Offline / event-triggered ingestion of insurer-side documents (standard wording, red-lines, prior approvals). Slow-changing inputs; runs when those documents are added or updated.
 - **Part B — Submission review.** Online, per-submission pipeline. Parses the broker pack, queries the KB, produces evidenced findings, captures reviewer feedback.
 
-The system never decides — it surfaces, explains, and routes. The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data for the next iteration.
+The system never decides — it surfaces, explains, and routes. **Every review suggestion is source-grounded: no finding renders to the underwriter without verbatim citations back to the specific document spans — broker clause, standard clause, red-line, prior approval, endorsement — that justify it.** The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data for the next iteration.
 
 ## 2. Architecture at a glance
 
@@ -279,18 +279,40 @@ Two further judges run alongside the divergence judge (§10), on the other two r
 
 Two hard rules on prior approvals: (a) nothing can be cited unless its `approval_id` was returned by the retriever — post-hoc lookup verifies; (b) different LoB never qualifies as transferable precedent (LoB filter), but is shown via the cross-LoB lookup with the mismatch named.
 
-### 12. Findings: evidence, source, confidence
+### 12. Findings — source-grounded citation
 
-Every finding persists before render, in the brief's schema:
+Findings are the system's externally-visible artefact, so source-grounding is enforced here, not assumed elsewhere. Every claim in a finding — evidence, rationale, recommended action, precedent reference — cites a specific document span. Prose without a citation slot is not allowed to reach render.
 
+Each finding persists as a structured record:
+
+```json
+{
+  "finding_id": "...",
+  "broker_clause_id": "BRG-§3",
+  "issue_type": "material_divergence | red_line_breach | broker_only_clause | standard_only_omission | …",
+  "why_it_matters": "Broker grants defence costs in addition to limit ([std-clause] requires within); breaches [red-line].",
+  "recommended_action": "Revert to standard wording at [std-clause], or escalate; do not rely on [prior-approval].",
+  "citations": [
+    { "role": "broker_clause",       "doc_id": "02_…", "clause_id": "BRG-§3", "span": {"page": 1, "start": 612, "end": 781}, "quote": "in addition to the Limit of Indemnity" },
+    { "role": "standard_clause",     "doc_id": "05_…", "clause_id": "STD-§3", "span": {...}, "quote": "form part of and not in addition to the Limit of Indemnity" },
+    { "role": "red_line",            "doc_id": "06_…", "red_line_id": "RL-03",            "quote": "Defence costs must not be payable outside or in addition to the limit" },
+    { "role": "prior_approval",      "doc_id": "08_…", "approval_id": "HELIX-UK-DO-2023-041", "clause_id": "...", "span": {...}, "quote": "in addition to the Limit of Liability", "transferability": "not_transferable", "reason_quote": "This approval relates to a Directors & Officers policy … not transferable to a Technology Professional Indemnity risk" },
+    { "role": "endorsement_overlay", "doc_id": "...", "clause_id": "...", "span": {...}, "quote": "..." }   // when applicable
+  ],
+  "confidence": 0.92,
+  "model_version": "...",
+  "prompt_hash": "..."
+}
 ```
-finding_id · clause_id · issue_type · why_it_matters ·
-comparison_source (standard_clause_id | red_line_id | prior_approval_id) ·
-quoted_evidence · prior_approval (id + transferability + delta) ·
-recommended_action · confidence · model_version · prompt_hash
-```
 
-Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: the quoted phrase is re-extracted from `text_raw` by exact match, and the finding is rejected if not found verbatim. This single gate removes most hallucinations cheaply.
+Two design choices make the citations load-bearing:
+
+- **Prose references citation slots, not free-floating text.** Both `why_it_matters` and `recommended_action` contain bracketed slot references (`[std-clause]`, `[red-line]`, `[prior-approval]`) that the UI resolves to the corresponding citation. The model is not permitted to name a document, a clause number, or a quote outside a citation slot — if it tries, the response is rejected and retried.
+- **Reasons themselves carry quotes.** When a prior approval is demoted as "not transferable", the citation includes `reason_quote` pointing at the underwriting note in the prior-approval document itself (e.g. Helix's *"not transferable to a Technology Professional Indemnity risk without separate underwriting review"*). The system never asserts a reason it can't quote.
+
+**Span-grounding gate (whole-finding).** Every citation passes exact-match re-extraction from its source's `text_raw`. If **any** citation fails, the entire finding is rejected — not just the failing citation — and the producing call is retried once before routing to manual review. This generalises the single-quote gate from §10/§11 to cover every span the finding mentions; it is the dominant anti-hallucination mechanism.
+
+**Confidence** combines retrieval score, judge self-reported confidence, the fraction of citations that grounded without retry, and the number of independent citation roles in the finding (a divergence backed by both standard-clause and red-line citations scores higher than one backed by standard-clause alone).
 
 ### 13. Worked example — Defence Costs
 
@@ -310,23 +332,23 @@ A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities
 
 ## 14. UX for the underwriter
 
-Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
+Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. **Every citation in a finding renders as a clickable chip** that scrolls the relevant source pane to the cited span and highlights it; chip labels show the role (`std §3`, `RL-03`, `Helix §1`) so the underwriter can audit a claim without reading prose. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
 
 Feedback *shape* matters more than volume. "Wrong precedent" trains a different model than "rationale incorrect"; both differ from "this is fine actually". Five explicit reject reasons plus free-text; edits to the recommended-action field are first-class training data.
 
 ## 15. Evaluation
 
-**Offline.** Curated gold set of ~150 broker clauses across the eight document families, each labelled with expected findings. Metrics: clause-level **recall**, **precision**, **evidence accuracy** (quoted span exact-matches the source), and **precedent F1** split by transferable/partial/not-transferable. Evidence accuracy is the dominant metric — recall and precision are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
+**Offline.** Curated gold set of ~150 broker clauses across the eight document families, each labelled with expected findings. Metrics: clause-level **recall**, **precision**, **citation accuracy** (per citation, across all roles — broker_clause, standard_clause, red_line, prior_approval, endorsement_overlay — quote exact-matches the source's `text_raw`), **citation completeness** (every claim in `why_it_matters` and `recommended_action` resolves to a citation slot), and **precedent F1** split by transferable / partial / not-transferable. Citation accuracy is the dominant metric — recall and precision are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
 
 **Online.** Reviewer accept-rate per finding type, time-to-decision, post-bind incident rate, false-negative discovery rate. Shadow-run every new prompt or model against recent submissions before promotion.
 
-**Adversarial corpus baked into CI:** structural reshuffles (rule hidden inside Definitions), defined-term shadowing, endorsements that fully override base wording (Endorsement 04 cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are narrower than the request (the Orion trap). Promotion gated on no-regression in evidence accuracy and red-line recall.
+**Adversarial corpus baked into CI:** structural reshuffles (rule hidden inside Definitions), defined-term shadowing, endorsements that fully override base wording (Endorsement 04 cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are narrower than the request (the Orion trap). Promotion gated on no-regression in citation accuracy and red-line recall.
 
 ## 16. Security, audit, monitoring
 
 Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC enforced at AI Search query time — prior approvals are insurer-confidential and tenant + role filters cannot be bypassed at render.
 
-Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of evidence accuracy in shadow runs.
+Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of citation accuracy in shadow runs.
 
 ## 17. Risks, trade-offs, MVP → target
 
