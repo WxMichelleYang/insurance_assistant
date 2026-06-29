@@ -45,6 +45,21 @@ Both pipelines run on AKS with services communicating over Kafka. Shared substra
 
 **MVP** runs Part B synchronously per submission with one strong LLM judge prompt. **Target state** routes by clause type — cheap classifier filters obvious clauses, specialist judges run per red-line category, active learning over reviewer disagreements.
 
+**The supplied pack, mapped to the architecture.** The case-study inputs split cleanly across the two pipelines:
+
+| File | Authored by | Sits in | Notes |
+|---|---|---|---|
+| `01_Submission_Schedule.docx` | Broker (Alder Finch) | Part B input | Placement slip for this client (BrightWave) |
+| `02_Broker_Base_Wording.docx` | Broker | Part B input | Proposed base policy wording |
+| `03_Endorsement_01_AcquiredEntities.docx` | Broker | Part B input | Endorsement to the base wording |
+| `04_Endorsement_04_CyberMedia.docx` | Broker | Part B input | Endorsement to the base wording |
+| `05_Standard_Wording_UK_TechPI.docx` | Insurer | Part A KB (`standard_clauses`) | Canonical position, versioned |
+| `06_Red_Lines_UK_TechPI.xlsx` | Insurer | Part A KB (`red_lines`) | Narrative absolute positions |
+| `07_Prior_Approval_Orion.docx` | Broker wording, **insurer artefact** | Part A KB (`prior_approvals`) | Insurer's approval record — incl. underwriting note |
+| `08_Prior_Approval_Helix.docx` | Broker wording, **insurer artefact** | Part A KB (`prior_approvals`) | As above; D&O — the LoB trap |
+
+The distinction on 07/08 matters: the underlying wording was authored by another broker (Orion's, Helix's), but the documents themselves are **insurer-confidential** — header marks "STRICTLY CONFIDENTIAL — INSURER INTERNAL USE ONLY", approval signed by EMEA Underwriting, with an insurer-authored note attached. They never sit in a broker's pack; they live in the insurer's KB and are produced by the promotion loop (sign-off → prior approval). The broker submitting BrightWave never sees Orion or Helix.
+
 ---
 
 ## Part A — Knowledge Base build
