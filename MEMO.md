@@ -71,7 +71,7 @@ Three document classes; each has a typed representation, a Mongo collection, and
 ### 3. Standard wording
 
 - **Source:** insurer's canonical position per LoB × region × version (`05_Standard_Wording_UK_TechPI.docx`).
-- **Ingest:** OOXML parse → segment by numbered headings → produce `Clause` records `{clause_id, doc_id, lob, region, version, heading_path, text, span, defined_terms}`. Defined terms (capitalised in the OOXML) are extracted into a per-document glossary so downstream comparison knows that the broker's *Insured* and our *Insured* are not the same object.
+- **Ingest:** OOXML parse → segment by numbered headings → produce `Clause` records (full schema in §7). Defined terms (capitalised in the OOXML) are extracted into a per-document glossary so downstream comparison knows that the broker's *Insured* and our *Insured* are not the same object.
 - **Store:** Mongo `standard_clauses`; AI Search index over text (vector + BM25) with `lob`, `region`, `version` as filterable facets.
 - **Versioning:** every standard wording is `(lob, region, version)`. Old versions are retained — past submissions must be reviewable against the version current at submission time, not against today's.
 
@@ -113,19 +113,72 @@ The three document classes update on independent cadences — the system handles
 
 **Parsing failures fail loud.** PDFs below 0.9 word-confidence (common for scanned prior approvals) route to manual triage rather than being parsed best-effort; the registry status `parse_failed` makes them visible at a glance. Garbage text produces confident-looking wrong findings — failing at ingest is much cheaper than catching it at review.
 
+### 7. Parsing and normalisation — implementation
+
+Part A and Part B share one Python parser library. It is organised as a deterministic stack of stages with one LLM-backed step (LoB inference) used only at submission time. Per-document output is the canonical `Clause` record at the end of this section.
+
+**Per-format readers.**
+
+- **DOCX** (`01–05`, `07–08`): `python-docx` for paragraphs, runs, headings, tables, headers/footers. For the few things the high-level API hides — list-numbering definitions in `word/numbering.xml`, custom styles, tracked-change markers — the reader falls back to direct OOXML parsing with `lxml`. Both endorsements and the schedule are DOCX; the reader sees them as paragraph streams plus table rows.
+- **XLSX** (`06`): `openpyxl`. The red-lines spreadsheet is row-per-record — each non-empty row becomes one `{red_line_id, lob, region, category, narrative}`.
+- **PDF / image** (production, not in this pack): Azure Document Intelligence `prebuilt-layout` returns paragraphs with bounding boxes, tables, and per-word confidence. Pages with mean confidence < 0.9 fail the stage with `parse_failed` and go to manual triage; we never feed best-effort OCR into retrieval.
+
+**Deterministic normalisation chain** (applied uniformly across formats):
+
+1. NFKC Unicode normalisation.
+2. Smart-quote → straight-quote; em-dash / en-dash collapsed to standard glyphs.
+3. Soft-hyphen and non-breaking space removed.
+4. Whitespace collapsed (paragraph breaks preserved; intra-paragraph runs squashed).
+5. Headers, footers, watermarks ("STRICTLY CONFIDENTIAL — INSURER INTERNAL USE ONLY"), and signature blocks ("Signed on behalf of…") stripped before segmentation.
+6. Each emitted clause carries both `text` (normalised, used by embeddings and judges) and `text_raw` (the unmodified substring of the source). Spans index into `text_raw`, so evidence quotes are re-extracted **verbatim** from the document the underwriter is reading.
+
+**Segmentation — two-pass.**
+
+1. *Heading-driven split.* A paragraph is a clause boundary if any **two** of: (a) the OOXML `w:pStyle` is `Heading 1/2/3`; (b) the prefix matches `^\d+\.` or `^\d+\.\d+`; (c) the first run is bold and all-caps. Requiring two signals avoids spurious splits on `(a)` / `(b)` sub-items inside definitions.
+2. *Body split.* Paragraphs longer than ~2000 characters are sentence-split with 200-char overlap so embedding windows are bounded. The unit of comparison is the smallest "rule-bearing unit" — typically a level-2 numbered paragraph (`§2.1`, `§3`, `§6`).
+
+`heading_path` is carried on every clause as the full ancestor chain (e.g. `["2. DEFINITIONS", "2.1 Insured"]`). This is the topic anchor for the standard-analogue retriever's first channel — heading-text similarity is robust even when the body has been heavily reworded.
+
+**Defined-term extraction.** A structured pass over each document's "DEFINITIONS" section: sub-items where the heading word matches the body's first defined word (`2.1 Insured … "Insured means: …"`) produce glossary entries `{term, definition, clause_id, span}`. Parenthetical shorthand introductions (`("the Insurer")`) are captured the same way. The glossary is attached to the document; every clause carries the list of terms it actually uses (`defined_terms_used`). The divergence judge receives both source and target glossaries, so it does not compare the broker's `Insured` against the standard's `Insured` as if they had the same scope — they don't.
+
+**Tables.** The submission schedule is mostly a two-column `(label, value)` table. The reader walks it via `python-docx` and maps known labels through an alias dictionary (`"Insured" | "Named Insured" → named_insured`; `"Class / Line of Business" → line_of_business`); unrecognised labels land in `extra_fields`. Tables embedded inside policy text (limit schedules, sub-limit grids) are linearised back into clause text with a marker so they remain searchable.
+
+**Endorsement linking.** Endorsements detected by header pattern (`ENDORSEMENT`, `ENDT-…`, "*Attached to and forming part of…*"). The parent base-wording reference is parsed out of the "*Attached to and forming part of the [Insured] [Policy Name]*" phrasing and stored as a Mongo relation `{endorsement_doc_id, base_doc_id, effective_order}` — so the broker's own order-of-precedence clause (broker §10 in this pack) drives evaluation rather than a hard-coded rule.
+
+**LoB inference (submission-time, low-confidence only).** When the schedule's `Class / Line of Business` is blank (as in the supplied pack), a constrained-output Azure OpenAI call (JSON mode, schema-validated) reads `{business_description, requested_features, top heading_paths, Insured definition}` and returns `{lob: enum, confidence, evidence: [spans]}`. Confidence < 0.85 pauses the pipeline for one-click underwriter confirmation before any KB query runs — the whole downstream is hard-filtered on LoB, so a wrong inference here invalidates every finding.
+
+**Canonical `Clause` record** — the parser's output, identical across all document classes:
+
+```json
+{
+  "clause_id": "BRG-WORD-§2.1",
+  "doc_id": "02_Broker_Base_Wording.docx#sha256:…",
+  "doc_type": "broker_base | standard_wording | red_line | prior_approval_clause | broker_endorsement",
+  "lob": "UK Tech PI", "region": "UK",
+  "version": "v3.0",
+  "heading_path": ["2. DEFINITIONS", "2.1 Insured"],
+  "text": "Insured means: (a) the Named Insured; and (b) …",
+  "text_raw": "Insured means:\n(a) the Named Insured; and\n(b) …",
+  "span": {"page": 1, "start_char": 1042, "end_char": 1387},
+  "defined_terms_used": ["Named Insured", "Business"],
+  "checksum": "sha256:…"
+}
+```
+
 ---
 
 ## Part B — Submission review
 
-### 7. Parsing the broker pack
+### 8. Submission-time additions
 
-Same `Clause` normalisation as the KB, plus:
+The broker pack runs through the §7 parser the same way as KB documents; the submission-specific additions are:
 
-- **Schedule** → typed record (Limit, Territory, Retroactive Date, requested features).
-- **LoB inference** when the Class field is blank (as in the supplied pack): constrained-output LLM call against an allow-list using business description + requested features. Low confidence prompts the underwriter before the pipeline fans out — this is load-bearing because every KB query is hard-filtered on LoB.
-- **Endorsements** become separate `Clause` records linked to the base wording with their order-of-precedence parsed from the broker's own wording (broker §10 in the pack), not hard-coded.
+- **Schedule → typed `Submission` record** (`named_insured`, `period`, `limit`, `retention`, `territory`, `jurisdiction`, `retroactive_date`, `requested_features`, `extra_fields`).
+- **LoB inference** fires only when the schedule's `Class / Line of Business` field is blank (it is, in this pack); see §7.
+- **Endorsement → base relations** are resolved against the broker's order-of-precedence clause (broker §10) at parse time, not at retrieval time, so judges always see the effective wording.
+- **KB snapshot pin.** The submission records its `kb_snapshot_id` before any retrieval call (see §6). All findings will be reproducible against this exact KB state.
 
-### 8. Retrieval — three queries per clause
+### 9. Retrieval — three queries per clause
 
 For each broker clause we fire three retrieval calls against the KB, all hard-filtered on broker `lob` and `region`:
 
@@ -139,7 +192,7 @@ All three are hybrid (dense vector + BM25). The standard-analogue query runs in 
 
 In **addition** to the hard-filtered prior-approval query, we run a parallel **cross-LoB lookup** with the LoB filter relaxed. Results are surfaced separately in the UI as "similar wording in other lines of business — not treated as precedent" so the underwriter sees that Helix-style near-matches were considered and rejected, rather than the system silently dropping them.
 
-### 9. LLM judgement
+### 10. LLM judgement
 
 Three judges, each receiving the broker clause plus the retrieved candidate verbatim, each returning a structured response with a **quoted phrase from the source** as evidence:
 
@@ -151,7 +204,7 @@ Endorsements are applied **after** base comparison: if Endorsement 04 affirms cy
 
 Two hard rules on prior approvals: (a) nothing can be cited unless its `approval_id` was returned by the retriever — post-hoc lookup verifies; (b) different LoB never qualifies as transferable precedent (LoB filter), but is shown via the cross-LoB lookup with the mismatch named.
 
-### 10. Findings: evidence, source, confidence
+### 11. Findings: evidence, source, confidence
 
 Every finding persists before render, in the brief's schema:
 
@@ -162,9 +215,9 @@ quoted_evidence · prior_approval (id + transferability + delta) ·
 recommended_action · confidence · model_version · prompt_hash
 ```
 
-Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: the quoted phrase is re-extracted from the source by exact match, and the finding is rejected if not found verbatim. This single gate removes most hallucinations cheaply.
+Confidence combines retrieval score, judge self-reported confidence, and — most importantly — a **span-grounding check**: the quoted phrase is re-extracted from `text_raw` by exact match, and the finding is rejected if not found verbatim. This single gate removes most hallucinations cheaply.
 
-### 11. Worked example — Defence Costs
+### 12. Worked example — Defence Costs
 
 | Field | Value |
 |---|---|
@@ -180,13 +233,13 @@ A second finding fires on §6 + Endorsement 01 (prior acts for acquired entities
 
 ---
 
-## 12. UX for the underwriter
+## 13. UX for the underwriter
 
 Three-pane review screen: submission schedule and finding list on the left; broker document with each finding highlighting a span in the centre; the comparison source — standard clause, red-line, or prior approval — pinned to the right when a finding is selected. Four actions per finding: *accept*, *edit*, *reject (one of five fixed reasons)*, *escalate*. Filters by issue type, red-line, severity, and "has prior approval". A separate panel shows cross-LoB near-precedents that the system **didn't** treat as binding, with the LoB mismatch named.
 
 Feedback *shape* matters more than volume. "Wrong precedent" trains a different model than "rationale incorrect"; both differ from "this is fine actually". Five explicit reject reasons plus free-text; edits to the recommended-action field are first-class training data.
 
-## 13. Evaluation
+## 14. Evaluation
 
 **Offline.** Curated gold set of ~150 broker clauses across the eight document families, each labelled with expected findings. Metrics: clause-level **recall**, **precision**, **evidence accuracy** (quoted span exact-matches the source), and **precedent F1** split by transferable/partial/not-transferable. Evidence accuracy is the dominant metric — recall and precision are tunable, but one hallucinated precedent breaks underwriter trust irrecoverably.
 
@@ -194,13 +247,13 @@ Feedback *shape* matters more than volume. "Wrong precedent" trains a different 
 
 **Adversarial corpus baked into CI:** structural reshuffles (rule hidden inside Definitions), defined-term shadowing, endorsements that fully override base wording (Endorsement 04 cyber), near-precedents from other LoBs (the Helix trap), and prior approvals that are narrower than the request (the Orion trap). Promotion gated on no-regression in evidence accuracy and red-line recall.
 
-## 14. Security, audit, monitoring
+## 15. Security, audit, monitoring
 
 Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prompt_template_version, model, model_version, retrieved_doc_ids, raw_response, parsed_response, latency, cost}` to SQL — audit trail *and* evaluation substrate. Findings carry their `prompt_hash` so any past decision is exactly reproducible. PII (insured names, addresses) is masked before LLM calls where the comparator doesn't need it. RBAC enforced at AI Search query time — prior approvals are insurer-confidential and tenant + role filters cannot be bypassed at render.
 
 Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of evidence accuracy in shadow runs.
 
-## 15. Risks, trade-offs, MVP → target
+## 16. Risks, trade-offs, MVP → target
 
 - **Hallucinated precedents** — mitigated by hard-grounded retrieval (no citation without retriever-returned ID), verbatim-quote requirement, LoB filter, adversarial Helix-style tests in CI.
 - **Endorsement override missed** — mitigated by parsing order-of-precedence and replaying base findings under endorsements; "suppressed by endorsement" trace rather than silent drop.
