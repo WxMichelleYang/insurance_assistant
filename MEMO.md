@@ -6,12 +6,7 @@
 
 ## 1. Problem & approach
 
-For every broker clause an underwriter must answer four questions: 
-1. Does it diverge from our standard wording?
-2. Does the divergence breach a red-line or create exposure?
-3. What exact text caused the issue? and
-4. Has a similar position been approved before — and is that precedent actually transferable?
-We propose a decision-support pipeline that returns a structured **finding set**, each finding evidenced by a verbatim text span from the source. The system never decides; it surfaces, explains, and routes. The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data.
+For every broker clause an underwriter must answer four questions: does it diverge from our standard wording, does the divergence breach a red-line or create exposure, what exact text caused the issue, and has a similar position been approved before — and is that precedent actually transferable. We propose a decision-support pipeline that returns a structured **finding set**, each finding evidenced by a verbatim text span from the source. The system never decides; it surfaces, explains, and routes. The underwriter accepts, edits, rejects, or escalates each finding, and those decisions become training data.
 
 ## 2. End-to-end architecture
 
