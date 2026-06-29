@@ -359,7 +359,32 @@ Blob with per-tenant CMK encryption. Every LLM call persists `{prompt_hash, prom
 
 Monitoring: cost per submission, p95 latency per stage, retrieval-empty rate, span-grounding-failure rate, judge-disagreement rate vs historical reviewer decisions. Alerts on regression of citation accuracy in shadow runs.
 
-## 17. Risks, trade-offs, MVP → target
+## 17. Design decisions and tradeoffs
+
+Three choices shaped the architecture. Each had a credible alternative; surfacing them explicitly so the reader can argue the choice rather than discover it implied across sections.
+
+**D1. RAG + multi-judge ensemble — not multi-agent.**
+
+- *Chosen.* A deterministic pipeline of single-shot, constrained-output LLM judges over retrieved context (§2). Each judge is stateless, JSON-schema-validated, span-grounded against `text_raw`, persisted with `prompt_hash`.
+- *Alternative considered.* A coordinating agent with tool-calling that adaptively decides what to retrieve, which judge to invoke, and when to escalate.
+- *Why we chose this.* The review workflow is predictable — every broker clause needs the same three retrievals and the same judge set, so there is no planning step for an agent to add value to. Determinism makes the brief's audit-trail constraint trivially satisfiable: same prompts + same `retrieved_doc_id`s → same finding, every time. Cost is bounded at ~4 LLM calls per matched clause vs high-variance agent loops, and each call's hallucination surface is gated by the span-grounding check; an agent's intermediate reasoning steps are not.
+- *What we give up.* Adaptivity for unusual submissions (heavily endorsed packs, chained cross-references, ambiguous LoBs). Mitigation: target-state escalation-packet agent handles those as a bounded subtask; the main review pipeline stays deterministic.
+
+**D2. Narrative red-lines stay narrative — not compiled to deterministic rules.**
+
+- *Chosen.* Each red-line is indexed as embedded narrative text with category + LoB filters; the red-line judge reads broker clause + retrieved red-line and decides whether the clause violates it (§4, §11).
+- *Alternative considered.* Compile each red-line into a deterministic rule (regex / structured pattern). RL-03 *"defence costs must be inside the limit"* → `if broker clause has 'in addition to' near 'limit' → flag`.
+- *Why we chose this.* Red-lines carry judgement that disappears in a regex. RL-01 *"No catch-all language to automatically allow cover for either: (i) companies which are not legally defined…"* is interpretive — what counts as "not legally defined" depends on context, and a deterministic encoding would either miss real breaches (false negatives — broker substitutes "affiliate" for "associated company") or over-fire on benign drafting (false positives). The LLM judge does the interpretation, the underwriter is the final arbiter.
+- *What we give up.* Reproducibility per red-line check is now model-bounded, not bit-exact across model versions. Mitigation: `prompt_hash` and `model_version` are persisted per finding (§12) so any verdict can be replayed against the same model; the gold set holds canonical breaches per red-line and CI promotion gates fail if any flip.
+
+**D3. Hard LoB filter on prior approvals — cross-LoB matches surfaced separately, not soft-demoted.**
+
+- *Chosen.* Prior-approval retrieval is hard-filtered on broker LoB (§9). A parallel cross-LoB lookup with the filter relaxed feeds a separate UI panel labelled *"similar wording in other lines of business — not treated as precedent"* (§14). Different-LoB matches can never enter the `citations` list of a finding (§12).
+- *Alternative considered.* Soft demotion via score weighting — keep cross-LoB matches in the same retrieval ranking but multiply their relevance by, say, 0.3.
+- *Why we chose this.* The Helix trap (D&O defence-costs advancement misread as Tech PI precedent) is exactly what soft demotion fails to catch: when surface text similarity is high (the in-addition-to-limit phrasing is nearly identical), a 0.3× multiplier doesn't reliably push it below a legitimate same-LoB match, and the LLM is then asked to make a binary keep/discard call it shouldn't be making. The hard filter makes the decision in code where it's auditable, not in the model where it's variable.
+- *What we give up.* A legitimately transferable cross-LoB precedent (rare but possible — e.g. a generic "knowledge of circumstances" carve-out that holds across PI lines) would be hidden from the citations list. Mitigation: the cross-LoB panel keeps it visible to the underwriter, who can promote it manually with a reason recorded as feedback — and that promotion is itself training signal.
+
+## 18. Risks, trade-offs, MVP → target
 
 - **Hallucinated precedents** — mitigated by hard-grounded retrieval (no citation without retriever-returned ID), verbatim-quote requirement, LoB filter, adversarial Helix-style tests in CI.
 - **Endorsement override missed** — mitigated by parsing order-of-precedence and replaying base findings under endorsements; "suppressed by endorsement" trace rather than silent drop.
